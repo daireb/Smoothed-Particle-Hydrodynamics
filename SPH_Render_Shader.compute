@@ -1,0 +1,145 @@
+struct Particle {
+    float2 position;
+    float2 velocity;
+
+    float mass;
+    float density;
+    float pressure;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWTexture2D<float4> textureOut;
+
+float domainHeight;
+float domainWidth;
+int renderMode;
+
+float h;
+
+// Smoothing kernel (Poly6 for 2D)
+float W(float2 r) {
+    float rLen = length(r);
+    if (rLen > h || rLen == 0.0) return 0.0;
+    float factor = 315.0 / (64.0 * 3.141592 * pow(h, 9));
+    float h2_r2 = h*h - rLen*rLen;
+    return factor * h2_r2 * h2_r2 * h2_r2;
+}
+
+float pollDensity(float2 pos) {
+    float density = 0.0;
+
+    // Accumulate density
+    for (uint i = 0; i < particles.Length; i++) {
+        density += particles[i].density * W(pos - particles[i].position);
+    }
+
+    return density;
+}
+
+float2 pollVelocity(float2 pos) {
+    float2 velocity = 0.0;
+
+    // Accumulate velocity
+    for (uint i = 0; i < particles.Length; i++) {
+        velocity += particles[i].velocity * W(pos - particles[i].position);
+    }
+
+    return velocity;
+}
+
+float pollPressure(float2 pos) {
+    float pressure = 0.0;
+
+    // Accumulate pressure
+    for (uint i = 0; i < particles.Length; i++) {
+        pressure += particles[i].pressure * W(pos - particles[i].position);
+    }
+
+    return pressure;
+}
+
+float4 GetSciColor(float val, float minVal, float maxVal) {
+    val = clamp(val, minVal, maxVal - 0.0001);
+    float range = maxVal - minVal;
+
+    val = (val - minVal) / range;
+    val = sqrt(val);
+
+    float m = 0.2;
+    int num = floor(val / m);
+    float s = (val - num * m) / m;
+
+    float r = 0.0, g = 0.0, b = 0.0;
+    switch (num) {
+        case 0:
+            r = (1-s) * 0.5; g = 0.5 - s*0.35; b = 0.5 + s*0.5;
+            break;
+        case 1:
+            r = 0.0; g = s * 0.85 + 0.15; b = 1.0;
+            break;
+        case 2:
+            r = 0.0; g = 1.0; b = 1.0 - s;
+            break;
+        case 3:
+            r = s; g = 1.0; b = 0.0;
+            break;
+        case 4:
+            r = 1.0; g = 1.0 - s; b = 0.0;
+            break;
+        default:
+            r = g = b = 0.0;
+            break;
+    }
+
+    return float4(r, g, b, 1.0);
+}
+
+float4 getDensityColor(float2 pos) {
+    float density = pollDensity(pos);
+
+    // Color calculations
+
+    float4 waterColor = float4(0, 0.25, 0.6, 1);
+
+    if (density > 0.05) {
+        float darkness = saturate(density * 0.25);
+        waterColor = lerp(waterColor, float4(0,0,0.1,1), darkness);
+    }
+
+    return waterColor;
+}
+
+float4 getVelocityColor(float2 pos) {
+    float speed = length(pollVelocity(pos));
+    return GetSciColor(speed, 0, 50);
+}
+
+float4 getPressureColor(float2 pos) {
+    float pressure = pollPressure(pos);
+    return GetSciColor(pressure, 0, 500);
+}
+
+#pragma kernel renderParticles
+[numthreads(8, 8, 1)]
+void renderParticles(uint3 id : SV_DispatchThreadID) { 
+    float2 uv = float2(id.x, id.y) / 1024 - float2(0.5,0); 
+    float2 pos = uv * max(domainWidth, domainHeight);
+
+    float4 waterColor;
+    if (renderMode == 2) {
+        waterColor = getVelocityColor(pos);
+    } else if (renderMode == 3) {
+        waterColor = getPressureColor(pos);
+    } else {
+        waterColor = getDensityColor(pos);
+    }
+    
+    float density = pollDensity(pos);
+    float colorIntensity = saturate(density * 5.0); 
+    if (colorIntensity < 0.05) {
+        colorIntensity = 0;
+    }
+
+    float4 fadedColor = lerp(float4(1,1,1,1), waterColor, colorIntensity);
+    textureOut[id.xy] = fadedColor;
+}

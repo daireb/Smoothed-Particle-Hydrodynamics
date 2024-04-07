@@ -1,0 +1,248 @@
+struct Particle {
+    float2 position;
+    float2 velocity;
+
+    float mass;
+    float density;
+    float pressure;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWStructuredBuffer<Particle> particlesNew;
+float DeltaTime;
+float pressureStiffness;
+float restDensity;
+float h;
+float nu;
+
+int particleCount;
+
+float2 mousePos;
+
+float domainHeight;
+float domainWidth;
+
+float lengthSquared(float2 vec) {
+    return dot(vec, vec);
+}
+
+#define PI 3.1415926535897938
+
+// Kernel functions
+
+// Spline kernel
+float kernel(float2 r) {
+    float q = length(r) / h;
+    float sigma = 40.0 / (7.0 * PI * pow(h, 2.0));
+
+    if (q < 1) {
+        return sigma * (1 - 1.5 * pow(q, 2) + 0.75 * pow(q, 3));
+    } else if (q < 2) {
+        return sigma * 0.25 * pow(2 - q, 3);
+    } else {
+        return 0;
+    }
+}
+
+float2 kernel_gradient(float2 r) {
+    float q = length(r) / h;
+    float sigma = 40.0 / (7.0 * PI * pow(h, 2.0));
+
+    if (q < 1) {
+        return sigma * (-3 * q + 2.25 * q * q) * normalize(r);
+    } else if (q < 2) {
+        //return float2(0,0);
+        return -sigma * 0.75 * pow(2 - q, 2) * normalize(r);
+    } else {
+        return float2(0,0);
+    }
+}
+
+float kernel_laplacian(float2 r) {
+    float q = length(r) / h;
+    float sigma = 40.0 / (7.0 * PI * pow(h, 2.0));
+
+    if (q < 1) {
+        return sigma * (6 * q - 4.5 * pow(q,2));
+    } else if (q < 2) {
+        return sigma * -0.75 * pow(2 - q, 2);
+    } else {
+        return 0;
+    }
+}
+
+// Spiky kernel
+
+float2 spiky_kernel_gradient(float2 r) {
+    float my_h = h*2;
+
+    float sigma = 10.0 / (PI * pow(my_h, 5.0));
+    float r_length = length(r);
+
+    if (r_length < my_h) {
+        return sigma * (-3 * pow(my_h - r_length,2)) * normalize(r);
+    } else {
+        return float2(0,0);
+    }
+}
+
+// Viscosity laplacian
+
+
+
+// Updating particle field values
+
+float computeDensity(uint i) {
+    Particle p = particles[i];
+    float density = 0;
+
+    for (uint j = 0; j < particleCount; j++) {
+        float2 r = particles[j].position - p.position;
+        density += particles[j].mass * kernel(r); 
+    }
+    
+    return density;
+}
+
+float computePressure(uint i) {
+    Particle p = particles[i];
+    return pressureStiffness * pow(p.density/restDensity,3);
+}
+
+// Physics
+
+float2 computeBoundaryForce(uint i) {
+    Particle p = particles[i];
+
+    float boundaryRepulsion = 50.0;
+    float gradientDistance = 2.0;
+    float2 force = float2(0.0, 0.0);
+
+    // Left and right boundaries
+    if (abs(p.position.x) > domainWidth/2 - gradientDistance) {
+        float distFromEdge = domainWidth/2 - abs(p.position.x);
+        float forceRatio = 1.0 - distFromEdge / gradientDistance;
+        force.x = -forceRatio * boundaryRepulsion * sign(p.position.x);
+    }
+
+    // Top and bottom boundaries
+    if (p.position.y < gradientDistance) {
+        float forceRatio = 1.0 - (p.position.y / gradientDistance);
+        force.y = forceRatio * boundaryRepulsion * 2.0;
+    } else if (p.position.y > domainHeight - gradientDistance) {
+        float forceRatio = 1.0 - ((domainHeight - p.position.y) / gradientDistance);
+        force.y = -forceRatio * boundaryRepulsion;
+    }
+
+    return force;
+}
+
+float2 computePressureForce(uint i) {
+    Particle p = particles[i];
+    float2 force = float2(0,0);
+
+    for (uint j = 0; j < particleCount; j++) {
+        if (i == j) continue;
+
+        float2 r = particles[j].position - p.position;
+        if (length(r) == 0) { // In case particles are on top of each other
+            float rand_dir = sign((int)i - (int)j);
+            r = float2(rand_dir*0.1, rand_dir*0.1);
+        }
+
+        //float pressure_scalar = particles[j].pressure / particles[j].density; // Naive gradient
+        float pressure_scalar = (particles[j].pressure / pow(particles[j].density,2) + p.pressure / pow(p.density,2)); // Symmetric gradient
+
+        force += kernel_gradient(r) * particles[j].mass * pressure_scalar;
+    }
+    
+    return force;
+}
+
+float2 computeViscosityForce(uint i) {
+    Particle p = particles[i];
+    float2 force = float2(0,0);
+
+    for (uint j = 0; j < particleCount; j++) {
+        if (i == j) continue;
+
+        float2 r = particles[j].position - p.position;
+
+        float2 velocityDiff = particles[j].velocity - p.velocity;
+
+        force += nu * kernel_laplacian(r) * velocityDiff * (particles[j].mass / particles[j].density);
+    }
+    
+    return force;
+}
+
+float2 computeBodyForces(uint i) {
+    float2 gravity = float2(0,-20);
+
+    float2 mouseForce = float2(0,0);
+    if (all(mousePos != float2(0, 0))) {
+        float2 offset = mousePos - particles[i].position;
+        float forceRatio = 1 - length(offset)/45;
+        if (forceRatio > 0) {
+            mouseForce = normalize(offset) * forceRatio * 150;
+        }
+    }
+    
+    return mouseForce + gravity;
+}
+
+float2 computeAcceleration(uint i) {
+    float2 net_force = computeBodyForces(i) + computePressureForce(i) + computeViscosityForce(i) + computeBoundaryForce(i);
+    
+    return net_force;
+}
+
+// Time Stepping
+
+#pragma kernel updateParticles // Updates carried values and applies forces
+[numthreads(128, 1, 1)]
+void updateParticles(uint3 id : SV_DispatchThreadID) {
+    if (id.x > particleCount) return;
+    uint i = id.x;
+
+    Particle p = particles[i];
+
+    p.density = computeDensity(i);
+    p.pressure = computePressure(i);
+
+    p.velocity += computeAcceleration(i) * DeltaTime;
+
+    particlesNew[i] = p;
+}
+
+#pragma kernel advectParticles // Advects particles based on their velocity, and clamps their positions within the domain
+[numthreads(128, 1, 1)]
+void advectParticles(uint3 id : SV_DispatchThreadID) {
+    if (id.x < particleCount) {
+        Particle p = particles[id.x];
+
+        p.position += p.velocity * DeltaTime;
+
+        // Clamping within domain
+
+        if (p.position.x < -domainWidth/2) {
+            p.position.x = -domainWidth/2;
+            p.velocity.x = max(p.velocity.x,0);
+        } else if (p.position.x > domainWidth/2) {
+            p.position.x = domainWidth/2;
+            p.velocity.x = min(p.velocity.x,0);
+        }
+
+        if (p.position.y < 0) {
+            p.position.y = 0;
+            p.velocity.y = max(p.velocity.y,0);
+        } else if (p.position.y > domainHeight) {
+            p.position.y = domainHeight;
+            p.velocity.y = min(p.velocity.y,0);
+        }
+
+        // Updating buffer
+
+        particlesNew[id.x] = p;
+    }
+}
