@@ -17,10 +17,10 @@ float nu;
 
 int particleCount;
 
-float2 mousePos;
-
 float domainHeight;
 float domainWidth;
+
+float gravityStrength;
 
 float lengthSquared(float2 vec) {
     return dot(vec, vec);
@@ -30,65 +30,88 @@ float lengthSquared(float2 vec) {
 
 // Kernel functions
 
-// Spline kernel
+// Monaghan's Spline kernel
 float kernel(float2 r) {
-    float q = length(r) / h;
-    float sigma = 40.0 / (7.0 * PI * pow(h, 2.0));
-
-    if (q < 1) {
-        return sigma * (1 - 1.5 * pow(q, 2) + 0.75 * pow(q, 3));
-    } else if (q < 2) {
-        return sigma * 0.25 * pow(2 - q, 3);
-    } else {
+    float q_squared = lengthSquared(r) / (h*h);
+    if (q_squared > 1) {
         return 0;
+    }
+
+    float sigma = 20.0 / (7.0 * PI * pow(h, 2.0));
+    float q = sqrt(q_squared);
+
+    if (q < 0.5) {
+        return sigma * (1 - 6 * q_squared + 6 * pow(q, 3));
+    } else { // < 1
+        return sigma * 2 * pow(2 - q, 3);
     }
 }
 
 float2 kernel_gradient(float2 r) {
-    float q = length(r) / h;
-    float sigma = 40.0 / (7.0 * PI * pow(h, 2.0));
+    float q_squared = lengthSquared(r) / (h*h);
+    if (q_squared > 1) {
+        return float2(0,0);
+    }
 
-    if (q < 1) {
-        return sigma * (-3 * q + 2.25 * q * q) * normalize(r);
-    } else if (q < 2) {
-        //return float2(0,0);
-        return -sigma * 0.75 * pow(2 - q, 2) * normalize(r);
+    float sigma = 20.0 / (7.0 * PI * pow(h, 2.0));
+    float q = sqrt(q_squared);
+
+    if (q < 0.5) {
+        return sigma * (18 * q_squared - 12 * q ) * normalize(r);
     } else {
         return float2(0,0);
+        //return -sigma * 0.75 * pow(2 - q, 2) * normalize(r);
     }
 }
 
 float kernel_laplacian(float2 r) {
-    float q = length(r) / h;
-    float sigma = 40.0 / (7.0 * PI * pow(h, 2.0));
+    float q_squared = lengthSquared(r) / (h*h);
+    if (q_squared > 1) {
+        return 0.0;
+    }
 
-    if (q < 1) {
-        return sigma * (6 * q - 4.5 * pow(q,2));
-    } else if (q < 2) {
-        return sigma * -0.75 * pow(2 - q, 2);
+    float sigma = 20.0 / (7.0 * PI * pow(h, 4.0)); // Note the adjustment for Laplacian
+    float q = sqrt(q_squared);
+
+    if (q < 0.5) {
+        float laplacian = sigma * ( -24.0 + 36.0 * q ) / (h*h);
+        return laplacian;
     } else {
-        return 0;
+
+        float laplacian = sigma * 12.0 * (1.0 - q) / (h*h);
+        return laplacian;
     }
 }
 
 // Spiky kernel
 
 float2 spiky_kernel_gradient(float2 r) {
-    float my_h = h*2;
-
-    float sigma = 10.0 / (PI * pow(my_h, 5.0));
-    float r_length = length(r);
-
-    if (r_length < my_h) {
-        return sigma * (-3 * pow(my_h - r_length,2)) * normalize(r);
-    } else {
-        return float2(0,0);
+    float q_squared = lengthSquared(r) / (h * h);
+    if (q_squared > 1) {
+        return float2(0, 0);
     }
+
+    float sigma = 10.0 / (PI * h * h);
+    float q = sqrt(q_squared);
+
+    float2 gradW = -3.0 * sigma * pow(1 - q, 2) * r / (h * h * q);
+    return gradW;
 }
 
 // Viscosity laplacian
 
+float viscosity_kernel_laplacian(float2 r) {
+    float q_squared = lengthSquared(r) / (h * h);
+    
+    if (q_squared > 1 || q_squared == 0) return 0.0;
 
+    float sigma = 10 / (3 * PI * h * h);
+    float q = sqrt(q_squared);
+
+    float laplacian = 3 * sigma * (1-q) / (h*h);
+    
+    return laplacian;
+}
 
 // Updating particle field values
 
@@ -106,7 +129,7 @@ float computeDensity(uint i) {
 
 float computePressure(uint i) {
     Particle p = particles[i];
-    return pressureStiffness * pow(p.density/restDensity,3);
+    return pressureStiffness * pow(p.density/restDensity,2);
 }
 
 // Physics
@@ -153,7 +176,7 @@ float2 computePressureForce(uint i) {
         //float pressure_scalar = particles[j].pressure / particles[j].density; // Naive gradient
         float pressure_scalar = (particles[j].pressure / pow(particles[j].density,2) + p.pressure / pow(p.density,2)); // Symmetric gradient
 
-        force += kernel_gradient(r) * particles[j].mass * pressure_scalar;
+        force += spiky_kernel_gradient(r) * particles[j].mass * pressure_scalar;
     }
     
     return force;
@@ -170,25 +193,16 @@ float2 computeViscosityForce(uint i) {
 
         float2 velocityDiff = particles[j].velocity - p.velocity;
 
-        force += nu * kernel_laplacian(r) * velocityDiff * (particles[j].mass / particles[j].density);
+        force += nu * viscosity_kernel_laplacian(r) * velocityDiff * (particles[j].mass / particles[j].density);
     }
     
     return force;
 }
 
 float2 computeBodyForces(uint i) {
-    float2 gravity = float2(0,-20);
-
-    float2 mouseForce = float2(0,0);
-    if (all(mousePos != float2(0, 0))) {
-        float2 offset = mousePos - particles[i].position;
-        float forceRatio = 1 - length(offset)/45;
-        if (forceRatio > 0) {
-            mouseForce = normalize(offset) * forceRatio * 150;
-        }
-    }
+    float2 gravity = float2(0,-gravityStrength);
     
-    return mouseForce + gravity;
+    return gravity;
 }
 
 float2 computeAcceleration(uint i) {
